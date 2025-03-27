@@ -1,5 +1,4 @@
 # gotfiles
-# Gotfiles
 
 Gotfiles is a simple Go-based tool for synchronizing your dotfiles and configuration files using Git. It helps you manage, backup, and deploy your dotfiles by creating a local repository, copying your current dotfiles, and establishing symlinks in your home directory.
 
