@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 )
 
+// Config holds the list of dotfiles and config folders to track.
 type Config struct {
 	Dotfiles []string `json:"dotfiles"`
 }
@@ -27,60 +28,7 @@ func loadConfig(configPath string) (*Config, error) {
 	return &cfg, nil
 }
 
-// processFile handles backing up a dotfile and ensuring the symlink exists.
-// The isSync flag differentiates between init (false) and sync (true) for logging.
-func processFile(file, homeDir, dotfilesRepoDir string, isSync bool) {
-	sourcePath := filepath.Join(homeDir, file)
-	destPath := filepath.Join(dotfilesRepoDir, file)
-
-	// Check if the file exists in home.
-	fi, err := os.Lstat(sourcePath)
-	if err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 {
-			fmt.Printf("Skipping backup for %s as it is already a symlink.\n", file)
-		} else {
-			// Not a symlink: copy and remove original.
-			if err := copyFile(sourcePath, destPath); err != nil {
-				log.Printf("Error copying %s: %v", file, err)
-			} else {
-				if isSync {
-					fmt.Printf("Updated %s in repository.\n", file)
-				} else {
-					fmt.Printf("Copied %s to repository.\n", file)
-				}
-			}
-			if err := os.Remove(sourcePath); err != nil {
-				log.Printf("Error removing original file %s: %v", file, err)
-			}
-		}
-	} else if !os.IsNotExist(err) {
-		log.Printf("Error accessing %s: %v", file, err)
-	} else {
-		log.Printf("%s does not exist in home.", file)
-	}
-
-	// Ensure the symlink exists.
-	if _, err := os.Lstat(sourcePath); os.IsNotExist(err) {
-		if _, err := os.Stat(destPath); err == nil {
-			if err := os.Symlink(destPath, sourcePath); err != nil {
-				log.Printf("Error creating symlink for %s: %v", file, err)
-			} else {
-				fmt.Printf("Created symlink for %s.\n", file)
-			}
-		} else {
-			log.Printf("No backup for %s found in repository.", file)
-		}
-	}
-}
-
-func runGitCommand(dir string, args ...string) error {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
+// copyFile copies a single file from src to dst.
 func copyFile(src, dst string) error {
 	input, err := os.Open(src)
 	if err != nil {
@@ -103,7 +51,108 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-func initCmd(dotfiles []string) error {
+// copyDir recursively copies a directory tree, attempting to preserve permissions.
+func copyDir(src, dst string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(dst, srcInfo.Mode()); err != nil {
+		return err
+	}
+
+	entries, err := ioutil.ReadDir(src)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+
+		if entry.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+		} else {
+			if err := copyFile(srcPath, dstPath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// processPath handles backing up a file or directory and ensuring the symlink exists.
+func processPath(item, homeDir, dotfilesRepoDir string, isSync bool) {
+	sourcePath := filepath.Join(homeDir, item)
+	destPath := filepath.Join(dotfilesRepoDir, item)
+
+	fi, err := os.Lstat(sourcePath)
+	if err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			fmt.Printf("Skipping backup for %s as it is already a symlink.\n", item)
+		} else if fi.IsDir() {
+			// Copy directory recursively.
+			if err := copyDir(sourcePath, destPath); err != nil {
+				log.Printf("Error copying directory %s: %v", item, err)
+			} else {
+				if isSync {
+					fmt.Printf("Updated directory %s in repository.\n", item)
+				} else {
+					fmt.Printf("Copied directory %s to repository.\n", item)
+				}
+			}
+			// Remove the original directory.
+			if err := os.RemoveAll(sourcePath); err != nil {
+				log.Printf("Error removing original directory %s: %v", item, err)
+			}
+		} else {
+			// Copy file.
+			if err := copyFile(sourcePath, destPath); err != nil {
+				log.Printf("Error copying file %s: %v", item, err)
+			} else {
+				if isSync {
+					fmt.Printf("Updated file %s in repository.\n", item)
+				} else {
+					fmt.Printf("Copied file %s to repository.\n", item)
+				}
+			}
+			// Remove the original file.
+			if err := os.Remove(sourcePath); err != nil {
+				log.Printf("Error removing original file %s: %v", item, err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		log.Printf("Error accessing %s: %v", item, err)
+	} else {
+		log.Printf("%s does not exist in home.", item)
+	}
+
+	// Create symlink if the source no longer exists.
+	if _, err := os.Lstat(sourcePath); os.IsNotExist(err) {
+		if _, err := os.Stat(destPath); err == nil {
+			if err := os.Symlink(destPath, sourcePath); err != nil {
+				log.Printf("Error creating symlink for %s: %v", item, err)
+			} else {
+				fmt.Printf("Created symlink for %s.\n", item)
+			}
+		} else {
+			log.Printf("No backup for %s found in repository.", item)
+		}
+	}
+}
+
+func runGitCommand(dir string, args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func initCmd(items []string) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -117,8 +166,8 @@ func initCmd(dotfiles []string) error {
 		return err
 	}
 
-	for _, file := range dotfiles {
-		processFile(file, homeDir, dotfilesRepoDir, false)
+	for _, item := range items {
+		processPath(item, homeDir, dotfilesRepoDir, false)
 	}
 
 	if err := runGitCommand(repoDir, "add", "."); err != nil {
@@ -133,7 +182,7 @@ func initCmd(dotfiles []string) error {
 	return nil
 }
 
-func syncCmd(dotfiles []string) error {
+func syncCmd(items []string) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -147,8 +196,8 @@ func syncCmd(dotfiles []string) error {
 		return fmt.Errorf("dotfiles repository directory does not exist. Run 'gotfiles init' first")
 	}
 
-	for _, file := range dotfiles {
-		processFile(file, homeDir, dotfilesRepoDir, true)
+	for _, item := range items {
+		processPath(item, homeDir, dotfilesRepoDir, true)
 	}
 
 	if err := runGitCommand(repoDir, "add", "."); err != nil {
